@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import os
+from io import BytesIO
 
 import aiohttp
 from pyrogram import Client, filters
@@ -15,7 +16,7 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
-    ChosenInlineResult,
+    InputMediaPhoto,
 )
 from pyrogram.enums import ChatAction
 
@@ -31,7 +32,6 @@ API_BASE  = "https://api.onegrab.fun"
 HEADERS = {"X-API-Key": API_KEY}
 
 _url_store: dict[str, str] = {}
-_inline_chat: dict[str, int] = {}
 
 MUSIC_PLATFORMS = (
     "youtube.com", "youtu.be", "music.youtube.com",
@@ -89,6 +89,18 @@ async def webm_to_mp3(webm_path: str, mp3_path: str) -> bool:
     )
     await proc.wait()
     return proc.returncode == 0
+
+
+async def download_to_temp(session: aiohttp.ClientSession, url: str, path: str) -> bool:
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return False
+            with open(path, "wb") as f:
+                f.write(await resp.read())
+        return True
+    except Exception:
+        return False
 
 
 @app.on_message(filters.command("start"))
@@ -193,14 +205,13 @@ async def inline_search(client: Client, query: InlineQuery):
     url_type = classify_url(text)
 
     if url_type:
-        result_id = _make_id(text)
         key       = _store_url(text)
         label     = "📥 Download Video/Media" if url_type == "snap" else "🎵 Download Audio"
         cb_prefix = "snap" if url_type == "snap" else "dl"
 
         return await query.answer([
             InlineQueryResultArticle(
-                id=result_id,
+                id=_make_id(text),
                 title=label,
                 description=text[:80],
                 input_message_content=InputTextMessageContent(f"⏳ Processing `{text}`..."),
@@ -250,38 +261,26 @@ async def inline_search(client: Client, query: InlineQuery):
     await query.answer(results, cache_time=10)
 
 
-@app.on_chosen_inline_result()
-async def chosen_result(client: Client, result: ChosenInlineResult):
-    # Pyrogram ChosenInlineResult mein chat_id milta hai
-    if result.chat_id:
-        _inline_chat[result.inline_message_id] = result.chat_id
-
-
 @app.on_callback_query()
 async def callback_handler(client: Client, query: CallbackQuery):
     await query.answer()
 
-    # Group/PM se aaya — seedha wahi bhejo
-    if query.message:
-        chat_id  = query.message.chat.id
-        reply_to = query.message.id
-    else:
-        # Inline message callback — saved chat_id use karo
-        chat_id  = _inline_chat.get(query.inline_message_id)
-        reply_to = None
-        if not chat_id:
-            return await client.send_message(query.from_user.id, "❌ Session expired, send the URL again.")
+    if query.message is None:
+        return
+
+    chat_id  = query.message.chat.id
+    reply_to = query.message.id
 
     if query.data.startswith("dl:"):
         url = _get_url(query.data[3:])
         if not url:
-            return await client.send_message(chat_id, "❌ Session expired.")
+            return await client.send_message(chat_id, "❌ Session expired, send the URL again.")
         await _download_and_send(client, chat_id, url, reply_to=reply_to)
 
     elif query.data.startswith("snap:"):
         url = _get_url(query.data[5:])
         if not url:
-            return await client.send_message(chat_id, "❌ Session expired.")
+            return await client.send_message(chat_id, "❌ Session expired, send the URL again.")
         await _snap_and_send(client, chat_id, url, reply_to=reply_to)
 
 
@@ -309,50 +308,84 @@ async def _snap_and_send(client: Client, chat_id: int, url: str, reply_to: int =
 
     await wait.edit("📥 Downloading...")
 
+    sent_any = False
+
     async with aiohttp.ClientSession() as session:
-        for item in videos[:4]:
+        for i, item in enumerate(videos[:4]):
             video_url = item.get("url") or ""
+            thumb_url = item.get("thumbnail") or ""
             if not video_url:
                 continue
+            tmp_video = f"/tmp/snap_video_{chat_id}_{i}.mp4"
+            tmp_thumb = f"/tmp/snap_thumb_{chat_id}_{i}.jpg"
             try:
-                async with session.get(video_url) as resp:
-                    if resp.status != 200:
-                        continue
-                    video_bytes = await resp.read()
+                if not await download_to_temp(session, video_url, tmp_video):
+                    continue
+                thumb_ok = False
+                if thumb_url:
+                    thumb_ok = await download_to_temp(session, thumb_url, tmp_thumb)
                 await client.send_video(
                     chat_id,
-                    video=video_bytes,
-                    caption=caption,
+                    video=tmp_video,
+                    caption=caption if not sent_any else None,
+                    thumb=tmp_thumb if thumb_ok else None,
                     supports_streaming=True,
                 )
+                sent_any = True
             except Exception as e:
                 logger.warning(f"Video send failed: {e}")
+            finally:
+                for p in (tmp_video, tmp_thumb):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
-        for item in audios[:2]:
+        for i, item in enumerate(audios[:2]):
             audio_url = item.get("url") or ""
             if not audio_url:
                 continue
+            tmp_audio = f"/tmp/snap_audio_{chat_id}_{i}.mp3"
             try:
-                async with session.get(audio_url) as resp:
-                    if resp.status != 200:
-                        continue
-                    audio_bytes = await resp.read()
-                await client.send_audio(chat_id, audio=audio_bytes, caption=caption)
+                if not await download_to_temp(session, audio_url, tmp_audio):
+                    continue
+                await client.send_audio(
+                    chat_id,
+                    audio=tmp_audio,
+                    caption=caption if not sent_any else None,
+                )
+                sent_any = True
             except Exception as e:
                 logger.warning(f"Audio send failed: {e}")
+            finally:
+                try:
+                    os.remove(tmp_audio)
+                except Exception:
+                    pass
 
-        if images and not videos:
-            from pyrogram.types import InputMediaPhoto as PyroInputMediaPhoto
+        if images and not sent_any:
+            tmp_imgs = []
             media_group = []
-            for img_url in images[:10]:
-                if isinstance(img_url, str) and img_url:
-                    media_group.append(PyroInputMediaPhoto(img_url))
+            for i, img_url in enumerate(images[:10]):
+                if not isinstance(img_url, str) or not img_url:
+                    continue
+                tmp_img = f"/tmp/snap_img_{chat_id}_{i}.jpg"
+                if await download_to_temp(session, img_url, tmp_img):
+                    tmp_imgs.append(tmp_img)
+                    media_group.append(InputMediaPhoto(tmp_img))
+
             if media_group:
                 media_group[0].caption = caption
                 try:
                     await client.send_media_group(chat_id, media_group)
                 except Exception as e:
                     logger.warning(f"Photo group send failed: {e}")
+                finally:
+                    for p in tmp_imgs:
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
 
     await wait.delete()
 
