@@ -4,19 +4,24 @@ import asyncio
 import hashlib
 import logging
 import os
-from io import BytesIO
 
 import aiohttp
+import pyrogram
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message,
     InlineQuery,
     InlineQueryResultArticle,
+    InlineQueryResultPhoto,
+    InlineQueryResultVideo,
     InputTextMessageContent,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
     InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaAudio,
+    InputMediaDocument,
 )
 from pyrogram.enums import ChatAction
 
@@ -265,23 +270,224 @@ async def inline_search(client: Client, query: InlineQuery):
 async def callback_handler(client: Client, query: CallbackQuery):
     await query.answer()
 
-    if query.message is None:
-        return
-
-    chat_id  = query.message.chat.id
-    reply_to = query.message.id
+    is_inline = query.inline_message_id is not None and query.message is None
+    chat_id   = query.message.chat.id if not is_inline else None
+    reply_to  = query.message.id if not is_inline else None
 
     if query.data.startswith("dl:"):
         url = _get_url(query.data[3:])
         if not url:
-            return await client.send_message(chat_id, "❌ Session expired, send the URL again.")
-        await _download_and_send(client, chat_id, url, reply_to=reply_to)
+            target = chat_id or query.from_user.id
+            return await client.send_message(target, "❌ Session expired, send the URL again.")
+        if is_inline:
+            await _download_inline(client, query.inline_message_id, query.from_user.id, url)
+        else:
+            await _download_and_send(client, chat_id, url, reply_to=reply_to)
 
     elif query.data.startswith("snap:"):
         url = _get_url(query.data[5:])
         if not url:
-            return await client.send_message(chat_id, "❌ Session expired, send the URL again.")
-        await _snap_and_send(client, chat_id, url, reply_to=reply_to)
+            target = chat_id or query.from_user.id
+            return await client.send_message(target, "❌ Session expired, send the URL again.")
+        if is_inline:
+            await _snap_inline(client, query.inline_message_id, query.from_user.id, url)
+        else:
+            await _snap_and_send(client, chat_id, url, reply_to=reply_to)
+
+
+async def _snap_inline(client: Client, inline_message_id: str, user_id: int, url: str):
+    await client.edit_inline_text(inline_message_id=inline_message_id, text="⏳ Processing...")
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            data = await fetch_json(session, f"{API_BASE}/api/snap", {"url": url})
+        except Exception as e:
+            return await client.edit_inline_text(inline_message_id=inline_message_id, text=f"❌ Error: {e}")
+
+    if not data or "error" in data:
+        return await client.edit_inline_text(inline_message_id=inline_message_id, text="❌ No media found.")
+
+    videos  = data.get("videos") or []
+    audios  = data.get("audios") or []
+    images  = data.get("images") or []
+    title   = data.get("title", "")
+    caption = title[:900] if title else None
+
+    if not videos and not audios and not images:
+        return await client.edit_inline_text(inline_message_id=inline_message_id, text="❌ No media found.")
+
+    await client.edit_inline_text(inline_message_id=inline_message_id, text="📥 Downloading...")
+
+    async with aiohttp.ClientSession() as session:
+        for i, item in enumerate(videos[:1]):
+            video_url = item.get("url") or ""
+            thumb_url = item.get("thumbnail") or ""
+            if not video_url:
+                continue
+            tmp_video = f"/tmp/sinl_v_{user_id}_{i}.mp4"
+            tmp_thumb = f"/tmp/sinl_t_{user_id}_{i}.jpg"
+            try:
+                if not await download_to_temp(session, video_url, tmp_video):
+                    continue
+                thumb_ok = bool(thumb_url and await download_to_temp(session, thumb_url, tmp_thumb))
+                await client.edit_inline_text(inline_message_id=inline_message_id, text="📤 Uploading...")
+                await client.edit_inline_media(
+                    inline_message_id=inline_message_id,
+                    media=InputMediaVideo(
+                        media=tmp_video,
+                        caption=caption,
+                        thumb=tmp_thumb if thumb_ok else None,
+                        supports_streaming=True,
+                    ),
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Inline video failed: {e}")
+            finally:
+                for p in (tmp_video, tmp_thumb):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+
+        for i, img_url in enumerate(images[:1]):
+            if not isinstance(img_url, str) or not img_url:
+                continue
+            tmp_img = f"/tmp/sinl_p_{user_id}_{i}.jpg"
+            try:
+                if not await download_to_temp(session, img_url, tmp_img):
+                    continue
+                await client.edit_inline_text(inline_message_id=inline_message_id, text="📤 Uploading...")
+                await client.edit_inline_media(
+                    inline_message_id=inline_message_id,
+                    media=InputMediaPhoto(
+                        media=tmp_img,
+                        caption=caption,
+                    ),
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Inline photo failed: {e}")
+            finally:
+                try:
+                    os.remove(tmp_img)
+                except Exception:
+                    pass
+
+        for i, item in enumerate(audios[:1]):
+            audio_url = item.get("url") or ""
+            if not audio_url:
+                continue
+            tmp_audio = f"/tmp/sinl_a_{user_id}_{i}.mp3"
+            try:
+                if not await download_to_temp(session, audio_url, tmp_audio):
+                    continue
+                await client.edit_inline_text(inline_message_id=inline_message_id, text="📤 Uploading...")
+                await client.edit_inline_media(
+                    inline_message_id=inline_message_id,
+                    media=InputMediaAudio(
+                        media=tmp_audio,
+                        caption=caption,
+                    ),
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Inline audio failed: {e}")
+            finally:
+                try:
+                    os.remove(tmp_audio)
+                except Exception:
+                    pass
+
+    await client.edit_inline_text(inline_message_id=inline_message_id, text="❌ Failed to process media.")
+
+
+async def _download_inline(client: Client, inline_message_id: str, user_id: int, url: str):
+    await client.edit_inline_text(inline_message_id=inline_message_id, text="⏳ Processing...")
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            track, meta = await asyncio.gather(
+                fetch_json(session, f"{API_BASE}/api/track", {"url": url}),
+                fetch_json(session, f"{API_BASE}/api/get_url", {"url": url}),
+            )
+        except Exception as e:
+            return await client.edit_inline_text(inline_message_id=inline_message_id, text=f"❌ Error: {e}")
+
+    if "cdnurl" not in track:
+        return await client.edit_inline_text(inline_message_id=inline_message_id, text=f"❌ Failed to get download URL.\n`{track}`")
+
+    cdn_url  = track["cdnurl"]
+    platform = track.get("platform", "")
+    info     = meta.get("results", [{}])[0]
+
+    title    = info.get("title")     or track.get("title")     or "Audio"
+    channel  = info.get("channel")   or track.get("channel")   or ""
+    duration = info.get("duration")  or track.get("duration")  or 0
+    thumb    = info.get("thumbnail") or track.get("thumbnail") or ""
+    video_id = track.get("id")       or _make_id(url)[:16]
+
+    caption = f"🎵 **{title}**"
+    if channel:
+        caption += f"\n👤 {channel}"
+    caption += f"\n🌐 {platform.capitalize()}"
+
+    await client.edit_inline_text(inline_message_id=inline_message_id, text=f"📥 Downloading **{title}**...")
+
+    webm_path  = f"/tmp/{video_id}_inl.webm"
+    mp3_path   = f"/tmp/{video_id}_inl.mp3"
+    thumb_path = f"/tmp/{video_id}_inl.jpg"
+
+    try:
+        msg_id = int(cdn_url.split("/")[-1])
+        await client.download_media(
+            await client.get_messages("FALLENAPI", msg_id),
+            file_name=webm_path,
+        )
+
+        if not os.path.exists(webm_path):
+            return await client.edit_inline_text(inline_message_id=inline_message_id, text="❌ Download failed.")
+
+        await client.edit_inline_text(inline_message_id=inline_message_id, text=f"🔄 Converting **{title}**...")
+
+        if not await webm_to_mp3(webm_path, mp3_path):
+            return await client.edit_inline_text(inline_message_id=inline_message_id, text="❌ Conversion failed.")
+
+        thumb_ok = False
+        if thumb:
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.get(thumb) as r:
+                        if r.status == 200:
+                            with open(thumb_path, "wb") as f:
+                                f.write(await r.read())
+                            thumb_ok = True
+                except Exception:
+                    pass
+
+        await client.edit_inline_text(inline_message_id=inline_message_id, text=f"📤 Uploading **{title}**...")
+
+        await client.edit_inline_media(
+            inline_message_id=inline_message_id,
+            media=InputMediaAudio(
+                media=mp3_path,
+                caption=caption,
+                duration=duration or None,
+                performer=channel or None,
+                title=title,
+                thumb=thumb_path if thumb_ok else None,
+            ),
+        )
+
+    except Exception as e:
+        await client.edit_inline_text(inline_message_id=inline_message_id, text=f"❌ Failed: {e}")
+
+    finally:
+        for path in (webm_path, mp3_path, thumb_path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 
 async def _snap_and_send(client: Client, chat_id: int, url: str, reply_to: int = None):
@@ -316,14 +522,12 @@ async def _snap_and_send(client: Client, chat_id: int, url: str, reply_to: int =
             thumb_url = item.get("thumbnail") or ""
             if not video_url:
                 continue
-            tmp_video = f"/tmp/snap_video_{chat_id}_{i}.mp4"
-            tmp_thumb = f"/tmp/snap_thumb_{chat_id}_{i}.jpg"
+            tmp_video = f"/tmp/snap_v_{chat_id}_{i}.mp4"
+            tmp_thumb = f"/tmp/snap_t_{chat_id}_{i}.jpg"
             try:
                 if not await download_to_temp(session, video_url, tmp_video):
                     continue
-                thumb_ok = False
-                if thumb_url:
-                    thumb_ok = await download_to_temp(session, thumb_url, tmp_thumb)
+                thumb_ok = bool(thumb_url and await download_to_temp(session, thumb_url, tmp_thumb))
                 await client.send_video(
                     chat_id,
                     video=tmp_video,
@@ -345,7 +549,7 @@ async def _snap_and_send(client: Client, chat_id: int, url: str, reply_to: int =
             audio_url = item.get("url") or ""
             if not audio_url:
                 continue
-            tmp_audio = f"/tmp/snap_audio_{chat_id}_{i}.mp3"
+            tmp_audio = f"/tmp/snap_a_{chat_id}_{i}.mp3"
             try:
                 if not await download_to_temp(session, audio_url, tmp_audio):
                     continue
@@ -364,16 +568,15 @@ async def _snap_and_send(client: Client, chat_id: int, url: str, reply_to: int =
                     pass
 
         if images and not sent_any:
-            tmp_imgs = []
+            tmp_imgs   = []
             media_group = []
             for i, img_url in enumerate(images[:10]):
                 if not isinstance(img_url, str) or not img_url:
                     continue
-                tmp_img = f"/tmp/snap_img_{chat_id}_{i}.jpg"
+                tmp_img = f"/tmp/snap_p_{chat_id}_{i}.jpg"
                 if await download_to_temp(session, img_url, tmp_img):
                     tmp_imgs.append(tmp_img)
                     media_group.append(InputMediaPhoto(tmp_img))
-
             if media_group:
                 media_group[0].caption = caption
                 try:
